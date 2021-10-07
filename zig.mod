@@ -4,3 +4,5 @@ license: MIT
 description: Fetch Rewards backend engineer coding take home coding exercise
 dev_dependencies:
 - src: git https://github.com/Luukdegram/apple_pie
+- src: git https://github.com/leroycep/chrono-zig
+
