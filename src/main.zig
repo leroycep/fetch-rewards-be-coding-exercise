@@ -2,6 +2,7 @@ const std = @import("std");
 const http = @import("apple_pie");
 const router = http.router;
 const chrono = @import("chrono");
+const transaction_tree = @import("./transaction_tree.zig");
 
 //pub const io_mode = .evented;
 
@@ -138,6 +139,10 @@ fn getBalance(ctx: Context, response: *http.Response, request: http.Request) !vo
 fn parseDateTime(dtString: []const u8) !chrono.datetime.DateTime {
     const naive_datetime = try chrono.format.parseNaiveDateTime("%Y-%m-%dT%H:%M:%SZ", dtString);
     return naive_datetime.with_timezone(chrono.timezone.UTC);
+}
+
+test {
+    std.testing.refAllDecls(@This());
 }
 
 test "Use the oldest points" {
