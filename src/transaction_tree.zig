@@ -14,11 +14,13 @@ comptime {
 pub const Tree = struct {
     allocator: *std.mem.Allocator,
     root: ?NodePtr,
+    freeNodes: std.ArrayList(NodePtr),
 
     pub fn init(allocator: *std.mem.Allocator) @This() {
         return @This(){
             .allocator = allocator,
             .root = null,
+            .freeNodes = std.ArrayList(NodePtr).init(allocator),
         };
     }
 
@@ -28,6 +30,23 @@ pub const Tree = struct {
             root.destroyChildren(this.allocator);
             this.allocator.destroy(root);
         }
+        for (this.freeNodes.items) |free_node| {
+            this.allocator.destroy(free_node);
+        }
+        this.freeNodes.deinit();
+    }
+
+    fn createNode(this: *@This()) !NodePtr {
+        return this.freeNodes.popOrNull() orelse {
+            const node_slice = try this.allocator.allocWithOptions(Node, 1, PAGE_SIZE, null);
+            return &node_slice[0];
+        };
+    }
+
+    fn destroyNode(this: *@This(), node: NodePtr) void {
+        this.freeNodes.append(node) catch {
+            this.allocator.destroy(node);
+        };
     }
 
     pub fn putNoClobber(this: *@This(), timestamp: i64, change: i128) !void {
@@ -40,9 +59,7 @@ pub const Tree = struct {
                             this.allocator.destroy(root);
                         },
                         .split => |new_nodes| {
-                            const root_slice = try this.allocator.allocWithOptions(Node, 1, PAGE_SIZE, null);
-                            errdefer this.allocator.free(root_slice);
-                            const new_root = &root_slice[0];
+                            const new_root = try this.createNode();
 
                             std.debug.assert(new_nodes.len == 2);
                             new_root.header = .{
@@ -58,7 +75,7 @@ pub const Tree = struct {
                             }
 
                             this.root = new_root;
-                            this.allocator.destroy(root);
+                            this.destroyNode(root);
                         },
                     }
                 },
@@ -109,9 +126,7 @@ pub const Tree = struct {
                     switch (put_result) {
                         .update => |new_node| this.root = new_node,
                         .split => |new_nodes| {
-                            const root_slice = try this.allocator.allocWithOptions(Node, 1, PAGE_SIZE, null);
-                            errdefer this.allocator.free(root_slice);
-                            const new_root = &root_slice[0];
+                            const new_root = try this.createNode();
 
                             std.debug.assert(new_nodes.len == 2);
                             new_root.header = .{
@@ -130,14 +145,15 @@ pub const Tree = struct {
                         },
                     }
 
-                    for (path.items) |segment| {
-                        this.allocator.destroy(segment.node);
+                    {
+                        for (path.items) |segment| {
+                            this.destroyNode(segment.node);
+                        }
                     }
                 },
             }
         } else {
-            const root_slice = try this.allocator.allocWithOptions(Node, 1, PAGE_SIZE, null);
-            const root = &root_slice[0];
+            const root = try this.createNode();
 
             root.* = .{
                 .header = .{
@@ -162,20 +178,16 @@ pub const Tree = struct {
 
     /// Duplicates the leaf node and puts the given value into it. Caller is responsible for
     /// freeing the returned nodes and the node that was passed into.
-    fn putIntoLeafNode(this: @This(), leafNode: NodePtr, timestamp: i64, change: i128) !PutLeafResult {
+    fn putIntoLeafNode(this: *@This(), leafNode: NodePtr, timestamp: i64, change: i128) !PutLeafResult {
         std.debug.assert(leafNode.header.nodeType == .leaf);
         if (leafNode.header.count < MAX_LEAF_CELLS) {
-            const new_leaf = try leafNode.dupe(this.allocator);
+            const new_leaf = try this.createNode();
+            leafNode.copyTo(new_leaf);
             new_leaf.putLeafMutNoSplit(timestamp, change);
             return PutLeafResult{ .update = new_leaf };
         } else {
-            const left_node_slice = try this.allocator.allocWithOptions(Node, 1, PAGE_SIZE, null);
-            errdefer this.allocator.free(left_node_slice);
-            const left_node = &left_node_slice[0];
-
-            const right_node_slice = try this.allocator.allocWithOptions(Node, 1, PAGE_SIZE, null);
-            errdefer this.allocator.free(right_node_slice);
-            const right_node = &right_node_slice[0];
+            const left_node = try this.createNode();
+            const right_node = try this.createNode();
 
             const midpoint = leafNode.header.count / 2;
 
@@ -207,13 +219,11 @@ pub const Tree = struct {
     /// Duplicates the internal node and points it to the new child nodes.
     ///
     /// `cellIdx` is the index of the cell that was pointing to the child node before the update.
-    fn updateInternalNode(this: @This(), internalNode: NodePtr, cellIdx: usize, prevResult: PutLeafResult) !PutLeafResult {
+    fn updateInternalNode(this: *@This(), internalNode: NodePtr, cellIdx: usize, prevResult: PutLeafResult) !PutLeafResult {
         std.debug.assert(internalNode.header.nodeType == .internal);
         std.debug.assert(cellIdx <= internalNode.header.count);
         if (prevResult == .update or internalNode.header.count < MAX_INTERNAL_CELLS) {
-            const internal_slice = try this.allocator.allocWithOptions(Node, 1, PAGE_SIZE, null);
-            errdefer this.allocator.free(internal_slice);
-            const new_internal = &internal_slice[0];
+            const new_internal = try this.createNode();
 
             new_internal.header = internalNode.header;
 
@@ -255,13 +265,8 @@ pub const Tree = struct {
 
             return PutLeafResult{ .update = new_internal };
         } else {
-            const left_node_slice = try this.allocator.allocWithOptions(Node, 1, PAGE_SIZE, null);
-            errdefer this.allocator.free(left_node_slice);
-            const left_node = &left_node_slice[0];
-
-            const right_node_slice = try this.allocator.allocWithOptions(Node, 1, PAGE_SIZE, null);
-            errdefer this.allocator.free(right_node_slice);
-            const right_node = &right_node_slice[0];
+            const left_node = try this.createNode();
+            const right_node = try this.createNode();
 
             const midpoint = internalNode.header.count / 2;
 
@@ -362,8 +367,8 @@ pub const Tree = struct {
     }
 };
 
-const NodePtr = *align(PAGE_SIZE) const Node;
-const NodePtrMut = *align(PAGE_SIZE) Node;
+const NodePtr = *align(PAGE_SIZE) Node;
+//const NodePtrMut = *align(PAGE_SIZE) Node;
 
 const Node = extern struct {
     header: NodeHeader,
@@ -380,28 +385,22 @@ const Node = extern struct {
         }
     }
 
-    pub fn dupe(this: @This(), allocator: *std.mem.Allocator) !NodePtrMut {
-        const new_node_slice = try allocator.allocWithOptions(Node, 1, PAGE_SIZE, null);
-        errdefer this.allocator.free(new_node_slice);
-        const new_node = &new_node_slice[0];
-
-        new_node.header = this.header;
+    pub fn copyTo(this: @This(), other: NodePtr) void {
+        other.header = this.header;
 
         const count = this.header.count;
         switch (this.header.nodeType) {
             .leaf => std.mem.copy(
                 LeafCell,
-                new_node.cells.leaf[0..count],
+                other.cells.leaf[0..count],
                 this.cells.leaf[0..count],
             ),
             .internal => std.mem.copy(
                 InternalCell,
-                new_node.cells.internal[0..count],
+                other.cells.internal[0..count],
                 this.cells.internal[0..count],
             ),
         }
-
-        return new_node;
     }
 
     pub fn smallestTimestamp(this: @This()) i64 {
@@ -425,11 +424,23 @@ const Node = extern struct {
 
         var cumulative_change: i128 = 0;
         switch (this.header.nodeType) {
-            .leaf => for (this.cells.leaf[0..count]) |leaf_cell| {
-                cumulative_change += leaf_cell.change;
+            .leaf => {
+                var i: usize = 0;
+                while (i < count) : (i += 1) {
+                    cumulative_change += this.cells.leaf[i].change;
+                }
+                //for (this.cells.leaf[0..count]) |_, idx| {
+                //    cumulative_change += this.cells.leaf[idx].change;
+                //}
             },
-            .internal => for (this.cells.internal[0..count]) |internal_cell| {
-                cumulative_change += internal_cell.cumulativeChange;
+            .internal => {
+                //for (this.cells.internal[0..count]) |internal_cell| {
+                //    cumulative_change += internal_cell.cumulativeChange;
+                //}
+                var i: usize = 0;
+                while (i < count) : (i += 1) {
+                    cumulative_change += this.cells.internal[i].cumulativeChange;
+                }
             },
         }
 
@@ -465,7 +476,10 @@ const Node = extern struct {
                 // Insert cell in the middle of the array
                 var prev_cell = LeafCell{ .timestamp = timestamp, .change = change };
                 for (this.cells.leaf[idx .. this.header.count + 1]) |*cell_to_move| {
-                    std.mem.swap(LeafCell, &prev_cell, cell_to_move);
+                    const tmp = cell_to_move.*;
+                    cell_to_move.* = prev_cell;
+                    prev_cell = tmp;
+                    //std.mem.swap(LeafCell, &prev_cell, cell_to_move);
                 }
                 this.header.count += 1;
                 break;
