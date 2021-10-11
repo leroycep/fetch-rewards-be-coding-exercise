@@ -577,7 +577,7 @@ test "tree returns balance up to timestamp non inclusive" {
     try std.testing.expectEqual(@as(i128, 3_503), tree.getBalance(1002));
 }
 
-test "add 1_000_000 transactions and randomly query balance" {
+test "add 10_000 transactions and randomly query balance" {
     const t = tracy.trace(@src());
     defer t.end();
 
@@ -599,7 +599,7 @@ test "add 1_000_000 transactions and randomly query balance" {
 
         var balance: i128 = 0;
         var i: usize = 0;
-        while (i < 1_000_000) : (i += 1) {
+        while (i < 10_000) : (i += 1) {
             const amount = random.int(i64);
             try transactions.append(amount);
 
