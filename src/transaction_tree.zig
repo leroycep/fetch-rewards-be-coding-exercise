@@ -5,6 +5,7 @@ const LEAF_CELL_SIZE = 32;
 const INTERNAL_CELL_SIZE = 32;
 const MAX_LEAF_CELLS = (PAGE_SIZE - @sizeOf(NodeHeader)) / LEAF_CELL_SIZE;
 const MAX_INTERNAL_CELLS = (PAGE_SIZE - @sizeOf(NodeHeader)) / INTERNAL_CELL_SIZE;
+const MAX_DEPTH = 16;
 
 comptime {
     std.debug.assert(LEAF_CELL_SIZE == @sizeOf(LeafCell));
@@ -84,18 +85,20 @@ pub const Tree = struct {
                         node: NodePtr,
                         cellIdx: usize,
                     };
-                    var path = std.ArrayList(PathSegment).init(this.allocator);
-                    defer path.deinit();
+                    var path = try std.BoundedArray(PathSegment, MAX_DEPTH).init(0);
 
                     try path.append(.{ .node = root, .cellIdx = undefined });
 
-                    while (path.items[path.items.len - 1].node.header.nodeType == .internal) {
-                        const current = &path.items[path.items.len - 1];
-                        current.cellIdx = current.node.findInternalCellIdx(timestamp) orelse current.node.header.count - 1;
-                        const next_node = current.node.cells.internal[current.cellIdx].node;
-                        try path.append(.{ .node = next_node, .cellIdx = undefined });
+                    // Find leaf node
+                    {
+                        while (path.slice()[path.slice().len - 1].node.header.nodeType == .internal) {
+                            const current = &path.slice()[path.slice().len - 1];
+                            current.cellIdx = current.node.findInternalCellIdx(timestamp) orelse current.node.header.count - 1;
+                            const next_node = current.node.cells.internal[current.cellIdx].node;
+                            try path.append(.{ .node = next_node, .cellIdx = undefined });
+                        }
                     }
-                    const leaf_node = path.items[path.items.len - 1].node;
+                    const leaf_node = path.slice()[path.slice().len - 1].node;
                     std.debug.assert(leaf_node.header.nodeType == .leaf);
 
                     // Iterate over every node in path except the last
@@ -115,9 +118,9 @@ pub const Tree = struct {
                         }
                     }
 
-                    var path_idx = @intCast(isize, path.items.len) - 2;
+                    var path_idx = @intCast(isize, path.slice().len) - 2;
                     while (path_idx >= 0) : (path_idx -= 1) {
-                        const path_segment = &path.items[@intCast(usize, path_idx)];
+                        const path_segment = &path.slice()[@intCast(usize, path_idx)];
 
                         const new_put_result = try this.updateInternalNode(path_segment.node, path_segment.cellIdx, put_result);
                         put_result = new_put_result;
@@ -146,7 +149,7 @@ pub const Tree = struct {
                     }
 
                     {
-                        for (path.items) |segment| {
+                        for (path.slice()) |segment| {
                             this.destroyNode(segment.node);
                         }
                     }
