@@ -28,7 +28,7 @@ pub const Tree = struct {
     pub fn deinit(this: *@This()) void {
         if (this.root) |root| {
             // Iterate over root and free children nodes
-            root.destroyChildren(this.allocator);
+            root.destroyChildrenAlloc(this.allocator);
             this.allocator.destroy(root);
         }
         for (this.freeNodes.items) |free_node| {
@@ -57,7 +57,7 @@ pub const Tree = struct {
                     switch (try this.putIntoLeafNode(root, timestamp, change)) {
                         .update => |new_node| {
                             this.root = new_node;
-                            this.allocator.destroy(root);
+                            this.destroyNode(root);
                         },
                         .split => |new_nodes| {
                             const new_root = try this.createNode();
@@ -106,13 +106,13 @@ pub const Tree = struct {
                     errdefer {
                         switch (put_result) {
                             .update => |new_node| {
-                                new_node.destroyChildren(this.allocator);
-                                this.allocator.destroy(new_node);
+                                new_node.destroyChildren(this);
+                                this.destroyNode(new_node);
                             },
                             .split => |new_nodes| {
                                 for (new_nodes) |new_node| {
-                                    new_node.destroyChildren(this.allocator);
-                                    this.allocator.destroy(new_node);
+                                    new_node.destroyChildren(this);
+                                    this.destroyNode(new_node);
                                 }
                             },
                         }
@@ -380,10 +380,18 @@ const Node = extern struct {
         internal: [MAX_INTERNAL_CELLS]InternalCell,
     },
 
-    pub fn destroyChildren(this: @This(), allocator: *std.mem.Allocator) void {
+    pub fn destroyChildren(this: @This(), tree: *Tree) void {
         if (this.header.nodeType == .leaf) return;
         for (this.cells.internal[0..this.header.count]) |internal_cell| {
-            internal_cell.node.destroyChildren(allocator);
+            internal_cell.node.destroyChildren(tree);
+            tree.destroyNode(internal_cell.node);
+        }
+    }
+
+    pub fn destroyChildrenAlloc(this: @This(), allocator: *std.mem.Allocator) void {
+        if (this.header.nodeType == .leaf) return;
+        for (this.cells.internal[0..this.header.count]) |internal_cell| {
+            internal_cell.node.destroyChildrenAlloc(allocator);
             allocator.destroy(internal_cell.node);
         }
     }
