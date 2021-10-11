@@ -43,12 +43,23 @@ pub fn build(b: *std.build.Builder) void {
     const run_step = b.step("run", "Run the app");
     run_step.dependOn(&run_cmd.step);
 
+    const coverage = b.option(bool, "test-coverage", "Generate test coverage with kcov (supports linux)") orelse false;
+
     const tests = b.addTest("src/main.zig");
     tests.setTarget(target);
     tests.addPackage(deps.pkgs.apple_pie.pkg.?);
     tests.addPackage(deps.pkgs.chrono.pkg.?);
     tests.addPackage(tracy_dummy);
-    const test_step = b.step("test", "Run the apps tests");
+    if (coverage) {
+        tests.setExecCmd(&[_]?[]const u8{
+            "kcov",
+            "--exclude-pattern=lib/std,.zigmod",
+            "kcov-output",
+            null,
+        });
+    }
+
+    const test_step = b.step("test", "Run the app's tests");
     test_step.dependOn(&tests.step);
 
     const benchmark_target = if (!target.isGnuLibC()) target else glib_2_18_target: {
