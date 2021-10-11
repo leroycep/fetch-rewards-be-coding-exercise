@@ -2,22 +2,26 @@ const std = @import("std");
 const http = @import("apple_pie");
 const router = http.router;
 const chrono = @import("chrono");
-const transaction_tree = @import("./transaction_tree.zig");
+pub const transaction_tree = @import("./transaction_tree.zig");
 
 //pub const io_mode = .evented;
 
 const Context = struct {
     allocator: *std.mem.Allocator,
     payers: std.StringHashMap(Payer),
+    // Points in order of when they arrived
+    pointsInOrder: std.PriorityDequeue(TimestampedPoints),
 
     pub fn init(allocator: *std.mem.Allocator) @This() {
         return @This(){
             .allocator = allocator,
             .payers = std.StringHashMap(Payer).init(allocator),
+            .pointsInOrder = std.PriorityDequeue(TimestampedPoints).init(allocator, TimestampedPoints.orderByTimestamp),
         };
     }
 
     pub fn deinit(this: *@This()) void {
+        this.pointsInOrder.deinit();
         var iter = this.payers.valueIterator();
         while (iter.next()) |payer| {
             this.allocator.free(payer.name);
@@ -37,12 +41,26 @@ const Context = struct {
             if (points < 0) {
                 if (-points > gop.value_ptr.points) return error.PointsWouldBeNegative;
                 gop.value_ptr.points -= @intCast(u128, -points);
+
+                // TODO: Remove points from previous transaction
             } else {
                 gop.value_ptr.points += @intCast(u128, points);
+
+                try this.pointsInOrder.add(.{
+                    .payer = gop.value_ptr.name,
+                    .timestamp = datetime.toTimestamp(),
+                    .amount = points,
+                });
             }
         } else {
             gop.value_ptr.name = payer_name;
             gop.value_ptr.points = @intCast(u128, points);
+
+            try this.pointsInOrder.add(.{
+                .payer = gop.value_ptr.name,
+                .timestamp = datetime.toTimestamp(),
+                .amount = points,
+            });
         }
     }
 
@@ -102,11 +120,12 @@ const Payer = struct {
     points: u128,
 };
 
-const Points = struct {
-    timestamp: u64,
-    amount: u128,
+const TimestampedPoints = struct {
+    payer: []const u8,
+    timestamp: i64,
+    amount: i128,
 
-    pub fn order(a: @This(), b: @This()) std.math.Order {
+    pub fn orderByTimestamp(a: @This(), b: @This()) std.math.Order {
         return std.math.order(a.timestamp, b.timestamp);
     }
 };
@@ -115,7 +134,7 @@ pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
 
-    const my_context = Context.init(&gpa.allocator);
+    var my_context = Context.init(&gpa.allocator);
 
     const address = try std.net.Address.parseIp("127.0.0.1", 8080);
 
@@ -124,16 +143,23 @@ pub fn main() !void {
     try http.listenAndServe(
         &gpa.allocator,
         address,
-        my_context,
+        &my_context,
         comptime router.Router(*Context, &.{
             router.get("/balance", getBalance),
         }),
     );
 }
 
-fn getBalance(ctx: Context, response: *http.Response, request: http.Request) !void {
+fn getBalance(ctx: *Context, response: *http.Response, request: http.Request) !void {
     _ = request;
-    try response.writer().print("{s}", .{ctx.data});
+
+    var balance = try ctx.getBalance(ctx.allocator);
+    defer balance.deinit();
+
+    var iter = balance.iterator();
+    while (iter.next()) |entry| {
+        try response.writer().print("{s}: {}\n", .{entry.key_ptr.*, entry.value_ptr.*});
+    }
 }
 
 fn parseDateTime(dtString: []const u8) !chrono.datetime.DateTime {

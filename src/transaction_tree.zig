@@ -1,4 +1,5 @@
 const std = @import("std");
+const tracy = @import("tracy");
 
 const PAGE_SIZE = 4096;
 const LEAF_CELL_SIZE = 32;
@@ -51,6 +52,9 @@ pub const Tree = struct {
     }
 
     pub fn putNoClobber(this: *@This(), timestamp: i64, change: i128) !void {
+        const t = tracy.trace(@src());
+        defer t.end();
+
         if (this.root) |root| {
             switch (root.header.nodeType) {
                 .leaf => {
@@ -91,6 +95,9 @@ pub const Tree = struct {
 
                     // Find leaf node
                     {
+                        const t1 = tracy.trace(@src());
+                        defer t1.end();
+
                         while (path.slice()[path.slice().len - 1].node.header.nodeType == .internal) {
                             const current = &path.slice()[path.slice().len - 1];
                             current.cellIdx = current.node.findInternalCellIdx(timestamp) orelse current.node.header.count - 1;
@@ -149,6 +156,8 @@ pub const Tree = struct {
                     }
 
                     {
+                        const t1 = tracy.trace(@src());
+                        defer t1.end();
                         for (path.slice()) |segment| {
                             this.destroyNode(segment.node);
                         }
@@ -182,6 +191,8 @@ pub const Tree = struct {
     /// Duplicates the leaf node and puts the given value into it. Caller is responsible for
     /// freeing the returned nodes and the node that was passed into.
     fn putIntoLeafNode(this: *@This(), leafNode: NodePtr, timestamp: i64, change: i128) !PutLeafResult {
+        const t = tracy.trace(@src());
+        defer t.end();
         std.debug.assert(leafNode.header.nodeType == .leaf);
         if (leafNode.header.count < MAX_LEAF_CELLS) {
             const new_leaf = try this.createNode();
@@ -223,6 +234,8 @@ pub const Tree = struct {
     ///
     /// `cellIdx` is the index of the cell that was pointing to the child node before the update.
     fn updateInternalNode(this: *@This(), internalNode: NodePtr, cellIdx: usize, prevResult: PutLeafResult) !PutLeafResult {
+        const t = tracy.trace(@src());
+        defer t.end();
         std.debug.assert(internalNode.header.nodeType == .internal);
         std.debug.assert(cellIdx <= internalNode.header.count);
         if (prevResult == .update or internalNode.header.count < MAX_INTERNAL_CELLS) {
@@ -341,6 +354,9 @@ pub const Tree = struct {
     }
 
     pub fn getBalance(this: @This(), timestamp: i64) i128 {
+        const t = tracy.trace(@src());
+        defer t.end();
+
         var balance: i128 = 0;
         if (this.root) |root| {
             var node = root;
@@ -461,6 +477,9 @@ const Node = extern struct {
     /// Find the internal cell that points to a node that may contain the given timestamp, or
     /// null if the timestamp is greater than any timestamp in this node.
     pub fn findInternalCellIdx(this: @This(), timestamp: i64) ?usize {
+        const t = tracy.trace(@src());
+        defer t.end();
+
         std.debug.assert(this.header.nodeType == .internal);
 
         const count = this.header.count;
@@ -559,6 +578,9 @@ test "tree returns balance up to timestamp non inclusive" {
 }
 
 test "add 1_000_000 transactions and randomly query balance" {
+    const t = tracy.trace(@src());
+    defer t.end();
+
     var tree = Tree.init(std.testing.allocator);
     defer tree.deinit();
 
@@ -572,6 +594,9 @@ test "add 1_000_000 transactions and randomly query balance" {
 
     // Generate random transactions
     {
+        const t1 = tracy.trace(@src());
+        defer t1.end();
+
         var balance: i128 = 0;
         var i: usize = 0;
         while (i < 1_000_000) : (i += 1) {
@@ -586,6 +611,9 @@ test "add 1_000_000 transactions and randomly query balance" {
 
     // Put transactions into tree in random order
     {
+        const t1 = tracy.trace(@src());
+        defer t1.end();
+
         var shuffled_transaction_indices = try std.ArrayList(usize).initCapacity(std.testing.allocator, transactions.items.len);
         defer shuffled_transaction_indices.deinit();
         for (transactions.items) |_, i| {
@@ -601,6 +629,8 @@ test "add 1_000_000 transactions and randomly query balance" {
     }
 
     // Ensure that the tree matches the running balance at each index
+    const t1 = tracy.trace(@src());
+    defer t1.end();
     for (running_balance.items) |balance, txIdx| {
         try std.testing.expectEqual(balance, tree.getBalance(@intCast(i64, txIdx)));
     }
