@@ -3,65 +3,48 @@ const http = @import("apple_pie");
 const router = http.router;
 const chrono = @import("chrono");
 pub const transaction_tree = @import("./transaction_tree.zig");
+const ArrayDeque = @import("./array_deque.zig").ArrayDeque;
 
 //pub const io_mode = .evented;
 
 const Context = struct {
     allocator: *std.mem.Allocator,
     payers: std.StringHashMap(Payer),
-    // Points in order of when they arrived
-    pointsInOrder: std.PriorityDequeue(TimestampedPoints),
 
     pub fn init(allocator: *std.mem.Allocator) @This() {
         return @This(){
             .allocator = allocator,
             .payers = std.StringHashMap(Payer).init(allocator),
-            .pointsInOrder = std.PriorityDequeue(TimestampedPoints).init(allocator, TimestampedPoints.orderByTimestamp),
         };
     }
 
     pub fn deinit(this: *@This()) void {
-        this.pointsInOrder.deinit();
         var iter = this.payers.valueIterator();
         while (iter.next()) |payer| {
+            payer.transactions.deinit();
             this.allocator.free(payer.name);
         }
         this.payers.deinit();
     }
 
     pub fn addPoints(this: *@This(), datetime: chrono.datetime.DateTime, payer: []const u8, points: i128) !void {
-        _ = datetime;
-
-        const payer_name = try this.allocator.dupe(u8, payer);
-        errdefer this.allocator.free(payer_name);
-
-        const gop = try this.payers.getOrPut(payer_name);
-        if (gop.found_existing) {
-            this.allocator.free(payer_name);
-            if (points < 0) {
-                if (-points > gop.value_ptr.points) return error.PointsWouldBeNegative;
-                gop.value_ptr.points -= @intCast(u128, -points);
-
-                // TODO: Remove points from previous transaction
-            } else {
-                gop.value_ptr.points += @intCast(u128, points);
-
-                try this.pointsInOrder.add(.{
-                    .payer = gop.value_ptr.name,
-                    .timestamp = datetime.toTimestamp(),
-                    .amount = points,
-                });
-            }
-        } else {
-            gop.value_ptr.name = payer_name;
-            gop.value_ptr.points = @intCast(u128, points);
-
-            try this.pointsInOrder.add(.{
-                .payer = gop.value_ptr.name,
-                .timestamp = datetime.toTimestamp(),
-                .amount = points,
-            });
+        const gop = try this.payers.getOrPut(payer);
+        if (!gop.found_existing) {
+            gop.value_ptr.name = try this.allocator.dupe(u8, payer);
+            gop.value_ptr.transactions = transaction_tree.Tree.init(this.allocator);
         }
+
+        const timestamp = datetime.toTimestamp();
+
+        // Check if this would make the points negative at the time of the transaction
+        const balance_at_time = gop.value_ptr.transactions.getBalanceAtTime(timestamp);
+        if (points < 0 and balance_at_time + points < 0) return error.PointsWouldBeNegative;
+
+        // Check if this would make the points negative in total
+        const balance = gop.value_ptr.transactions.getBalance();
+        if (points < 0 and balance + points < 0) return error.PointsWouldBeNegative;
+
+        try gop.value_ptr.transactions.putNoClobber(datetime.toTimestamp(), points);
     }
 
     const SpentPoints = struct {
@@ -78,19 +61,22 @@ const Context = struct {
         points: i128,
     };
 
-    pub fn spendPoints(this: *@This(), allocator: *std.mem.Allocator, points: u128) !SpentPoints {
+    pub fn spendPoints(this: *@This(), allocator: *std.mem.Allocator, points: i128) !SpentPoints {
         var payers = std.ArrayList(SpentPayer).init(allocator);
         defer payers.deinit();
+
+        if (points < 0) return error.CantSpendNegativePoints;
 
         var points_left = points;
 
         var iter = this.payers.valueIterator();
         while (iter.next()) |payer| {
             if (points_left == 0) break;
-            if (payer.points > 0) {
-                const points_used = std.math.min(payer.points, points_left);
+            const balance = payer.transactions.getBalance();
+            if (balance > 0) {
+                const points_used = std.math.min(balance, points_left);
                 try payers.append(.{ .name = payer.name, .points = -@intCast(i128, points_used) });
-                payer.points -= points_used;
+                try payer.transactions.putNoClobber(std.time.timestamp(), -points_used);
                 points_left -= points_used;
             }
         }
@@ -101,14 +87,14 @@ const Context = struct {
         };
     }
 
-    pub fn getBalance(this: *@This(), allocator: *std.mem.Allocator) !std.StringHashMap(u128) {
-        var payers = std.StringHashMap(u128).init(allocator);
+    pub fn getBalance(this: *@This(), allocator: *std.mem.Allocator) !std.StringHashMap(i128) {
+        var payers = std.StringHashMap(i128).init(allocator);
         defer payers.deinit();
 
         var iter = this.payers.valueIterator();
         while (iter.next()) |payer| {
             std.log.warn("payer name = {s}", .{payer.name});
-            try payers.putNoClobber(payer.name, payer.points);
+            try payers.putNoClobber(payer.name, payer.transactions.getBalance());
         }
 
         return payers;
@@ -117,7 +103,40 @@ const Context = struct {
 
 const Payer = struct {
     name: []const u8,
-    points: u128,
+    transactions: transaction_tree.Tree,
+
+    pub const OldestPointsResult = struct {
+        timestamp: i64,
+        amount: i128,
+    };
+
+    fn oldestPoints(this: @This(), allocator: *std.mem.Allocator) !?OldestPointsResult {
+        var points_queue = ArrayDeque(OldestPointsResult).init(allocator);
+        defer points_queue.deinit();
+
+        var current_balance: i128 = 0;
+        var iter = this.transactions.iterator(.first);
+        while (try iter.next()) |entry| {
+            current_balance += entry.change;
+            if (entry.change > 0) {
+                try points_queue.push_back(.{ .timestamp = entry.timestamp, .amount = entry.change });
+            } else if (entry.change < 0) {
+                var points_to_remove = -entry.change;
+                while (points_to_remove > 0) {
+                    const oldest_points = points_queue.idxMut(0) orelse unreachable; // Balance should never dip below zero
+                    if (oldest_points.amount <= points_to_remove) {
+                        points_to_remove -= oldest_points.amount;
+                        _ = points_queue.pop_front();
+                    } else {
+                        oldest_points.amount -= points_to_remove;
+                        points_to_remove = 0;
+                    }
+                }
+            }
+        }
+
+        return points_queue.pop_front();
+    }
 };
 
 const TimestampedPoints = struct {
@@ -158,7 +177,7 @@ fn getBalance(ctx: *Context, response: *http.Response, request: http.Request) !v
 
     var iter = balance.iterator();
     while (iter.next()) |entry| {
-        try response.writer().print("{s}: {}\n", .{entry.key_ptr.*, entry.value_ptr.*});
+        try response.writer().print("{s}: {}\n", .{ entry.key_ptr.*, entry.value_ptr.* });
     }
 }
 
@@ -199,8 +218,31 @@ test "Use the oldest points" {
     var balance = try ctx.getBalance(std.testing.allocator);
     defer balance.deinit();
 
-    try std.testing.expectEqual(@as(u128, 1_000), balance.get("DANNON").?);
-    try std.testing.expectEqual(@as(u128, 0), balance.get("UNILEVER").?);
-    try std.testing.expectEqual(@as(u128, 5_300), balance.get("MILLER COORS").?);
-    try std.testing.expectEqual(@as(u128, 3), balance.count());
+    try std.testing.expectEqual(@as(i128, 1_000), balance.get("DANNON").?);
+    try std.testing.expectEqual(@as(i128, 0), balance.get("UNILEVER").?);
+    try std.testing.expectEqual(@as(i128, 5_300), balance.get("MILLER COORS").?);
+    try std.testing.expectEqual(@as(i128, 3), balance.count());
+}
+
+test "get payer's oldest points" {
+    var payer = Payer{
+        .name = "hello",
+        .transactions = transaction_tree.Tree.init(std.testing.allocator),
+    };
+    defer payer.transactions.deinit();
+
+    try payer.transactions.putNoClobber(100, 1_000);
+    try payer.transactions.putNoClobber(200, -500);
+    try payer.transactions.putNoClobber(250, -500);
+    try payer.transactions.putNoClobber(300, 1_000);
+    try payer.transactions.putNoClobber(666, 666);
+    try payer.transactions.putNoClobber(777, -666);
+    try payer.transactions.putNoClobber(1000, 1_337);
+    try payer.transactions.putNoClobber(1001, -500);
+
+    try std.testing.expectEqual(Payer.OldestPointsResult{ .timestamp = 666, .amount = 500 }, (try payer.oldestPoints(std.testing.allocator)).?);
+
+    try payer.transactions.putNoClobber(1002, -501);
+
+    try std.testing.expectEqual(Payer.OldestPointsResult{ .timestamp = 1000, .amount = 1336 }, (try payer.oldestPoints(std.testing.allocator)).?);
 }
