@@ -6,7 +6,7 @@ const LEAF_CELL_SIZE = 32;
 const INTERNAL_CELL_SIZE = 32;
 const MAX_LEAF_CELLS = (PAGE_SIZE - @sizeOf(NodeHeader)) / LEAF_CELL_SIZE;
 const MAX_INTERNAL_CELLS = (PAGE_SIZE - @sizeOf(NodeHeader)) / INTERNAL_CELL_SIZE;
-const MAX_DEPTH = 16;
+const MAX_DEPTH = 10;
 
 comptime {
     std.debug.assert(LEAF_CELL_SIZE == @sizeOf(LeafCell));
@@ -51,6 +51,11 @@ pub const Tree = struct {
         };
     }
 
+    const PathSegment = struct {
+        node: NodePtr,
+        cellIdx: usize,
+    };
+
     pub fn putNoClobber(this: *@This(), timestamp: i64, change: i128) !void {
         const t = tracy.trace(@src());
         defer t.end();
@@ -85,10 +90,6 @@ pub const Tree = struct {
                     }
                 },
                 .internal => {
-                    const PathSegment = struct {
-                        node: NodePtr,
-                        cellIdx: usize,
-                    };
                     var path = try std.BoundedArray(PathSegment, MAX_DEPTH).init(0);
 
                     try path.append(.{ .node = root, .cellIdx = undefined });
@@ -353,7 +354,18 @@ pub const Tree = struct {
         }
     }
 
-    pub fn getBalance(this: @This(), timestamp: i64) i128 {
+    pub fn getBalance(this: @This()) i128 {
+        const t = tracy.trace(@src());
+        defer t.end();
+
+        if (this.root) |root| {
+            return root.cumulativeChange();
+        }
+
+        return 0;
+    }
+
+    pub fn getBalanceAtTime(this: @This(), timestamp: i64) i128 {
         const t = tracy.trace(@src());
         defer t.end();
 
@@ -383,6 +395,100 @@ pub const Tree = struct {
         }
 
         return balance;
+    }
+
+    pub const Entry = struct {
+        timestamp: i64,
+        change: i128,
+    };
+
+    const Iterator = struct {
+        tree: *const Tree,
+        path: std.BoundedArray(PathSegment, MAX_DEPTH),
+
+        pub fn next(this: *@This()) !?Entry {
+            if (this.path.len == 0) return null;
+
+            var currentNode = &this.path.slice()[this.path.len - 1];
+            while (currentNode.cellIdx >= currentNode.node.header.count) {
+                _ = this.path.pop();
+                if (this.path.len < 1) return null;
+                currentNode = &this.path.slice()[this.path.len - 1];
+            }
+
+            while (currentNode.node.header.nodeType == .internal) {
+                if (currentNode.cellIdx >= currentNode.node.header.count) return null;
+                try this.path.append(.{
+                    .node = currentNode.node.cells.internal[currentNode.cellIdx].node,
+                    .cellIdx = 0,
+                });
+                currentNode.cellIdx += 1;
+                currentNode = &this.path.slice()[this.path.len - 1];
+            }
+
+            const cell = currentNode.node.cells.leaf[currentNode.cellIdx];
+            const entry = Entry{
+                .timestamp = cell.timestamp,
+                .change = cell.change,
+            };
+            currentNode.cellIdx += 1;
+            return entry;
+        }
+
+        pub fn prev(this: *@This()) !?Entry {
+            if (this.path.len == 0) return null;
+
+            var currentNode = &this.path.slice()[this.path.len - 1];
+            while (currentNode.cellIdx == 0) {
+                _ = this.path.pop();
+                if (this.path.len < 1) return null;
+                currentNode = &this.path.slice()[this.path.len - 1];
+            }
+
+            while (currentNode.node.header.nodeType == .internal) {
+                if (currentNode.cellIdx == 0) return null;
+                const prev_node = currentNode.node.cells.internal[currentNode.cellIdx - 1].node;
+                try this.path.append(.{
+                    .node = prev_node,
+                    .cellIdx = prev_node.header.count,
+                });
+                currentNode.cellIdx -= 1;
+                currentNode = &this.path.slice()[this.path.len - 1];
+            }
+
+            const cell = currentNode.node.cells.leaf[currentNode.cellIdx - 1];
+            const entry = Entry{
+                .timestamp = cell.timestamp,
+                .change = cell.change,
+            };
+            currentNode.cellIdx -= 1;
+            return entry;
+        }
+    };
+
+    pub const Position = union(enum) {
+        first: void,
+        last: void,
+    };
+
+    pub fn iterator(this: *const @This(), pos: Position) Iterator {
+        var path = std.BoundedArray(PathSegment, MAX_DEPTH).init(0) catch unreachable;
+        if (this.root) |root| {
+            switch (pos) {
+                .first => path.append(.{
+                    .node = root,
+                    .cellIdx = 0,
+                }) catch unreachable,
+                .last => path.append(.{
+                    .node = root,
+                    .cellIdx = root.header.count,
+                }) catch unreachable,
+            }
+        }
+        return Iterator{
+            .tree = this,
+            .path = path,
+        };
     }
 };
 
@@ -563,18 +669,18 @@ test "tree returns balance up to timestamp non inclusive" {
     try tree.putNoClobber(1000, 1_337);
     try tree.putNoClobber(1001, -500);
 
-    try std.testing.expectEqual(@as(i128, 0), tree.getBalance(100));
-    try std.testing.expectEqual(@as(i128, 1_000), tree.getBalance(101));
+    try std.testing.expectEqual(@as(i128, 0), tree.getBalanceAtTime(100));
+    try std.testing.expectEqual(@as(i128, 1_000), tree.getBalanceAtTime(101));
 
-    try std.testing.expectEqual(@as(i128, 1_000), tree.getBalance(300));
-    try std.testing.expectEqual(@as(i128, 2_000), tree.getBalance(301));
+    try std.testing.expectEqual(@as(i128, 1_000), tree.getBalanceAtTime(300));
+    try std.testing.expectEqual(@as(i128, 2_000), tree.getBalanceAtTime(301));
 
-    try std.testing.expectEqual(@as(i128, 2_000), tree.getBalance(666));
-    try std.testing.expectEqual(@as(i128, 2_666), tree.getBalance(667));
+    try std.testing.expectEqual(@as(i128, 2_000), tree.getBalanceAtTime(666));
+    try std.testing.expectEqual(@as(i128, 2_666), tree.getBalanceAtTime(667));
 
-    try std.testing.expectEqual(@as(i128, 2_666), tree.getBalance(1000));
-    try std.testing.expectEqual(@as(i128, 4_003), tree.getBalance(1001));
-    try std.testing.expectEqual(@as(i128, 3_503), tree.getBalance(1002));
+    try std.testing.expectEqual(@as(i128, 2_666), tree.getBalanceAtTime(1000));
+    try std.testing.expectEqual(@as(i128, 4_003), tree.getBalanceAtTime(1001));
+    try std.testing.expectEqual(@as(i128, 3_503), tree.getBalanceAtTime(1002));
 }
 
 test "add 10_000 transactions and randomly query balance" {
@@ -632,6 +738,61 @@ test "add 10_000 transactions and randomly query balance" {
     const t1 = tracy.trace(@src());
     defer t1.end();
     for (running_balance.items) |balance, txIdx| {
-        try std.testing.expectEqual(balance, tree.getBalance(@intCast(i64, txIdx)));
+        try std.testing.expectEqual(balance, tree.getBalanceAtTime(@intCast(i64, txIdx)));
+    }
+}
+
+test "add 1_000 transactions and iterate" {
+    var tree = Tree.init(std.testing.allocator);
+    defer tree.deinit();
+
+    var default_prng = std.rand.DefaultPrng.init(13280421048943141057);
+    const random = &default_prng.random;
+
+    var transactions = std.ArrayList(i128).init(std.testing.allocator);
+    defer transactions.deinit();
+
+    // Generate random transactions
+    {
+        var i: usize = 0;
+        while (i < 1_000) : (i += 1) {
+            try transactions.append(random.int(i64));
+        }
+    }
+
+    // Put transactions into tree in random order
+    {
+        var shuffled_transaction_indices = try std.ArrayList(usize).initCapacity(std.testing.allocator, transactions.items.len);
+        defer shuffled_transaction_indices.deinit();
+        for (transactions.items) |_, i| {
+            shuffled_transaction_indices.appendAssumeCapacity(i);
+        }
+
+        random.shuffle(usize, shuffled_transaction_indices.items);
+
+        for (shuffled_transaction_indices.items) |txIdx| {
+            const amount = transactions.items[txIdx];
+            try tree.putNoClobber(@intCast(i64, txIdx), amount);
+        }
+    }
+
+    // Ensure that the tree matches the running balance at each index
+    {
+        var iterator = tree.iterator(.first);
+        var count: usize = 0;
+        while (try iterator.next()) |entry| {
+            try std.testing.expectEqual(transactions.items[@intCast(usize, entry.timestamp)], entry.change);
+            count += 1;
+        }
+        try std.testing.expectEqual(transactions.items.len, count);
+    }
+    {
+        var iterator = tree.iterator(.last);
+        var count: usize = 0;
+        while (try iterator.prev()) |entry| {
+            try std.testing.expectEqual(transactions.items[@intCast(usize, entry.timestamp)], entry.change);
+            count += 1;
+        }
+        try std.testing.expectEqual(transactions.items.len, count);
     }
 }
