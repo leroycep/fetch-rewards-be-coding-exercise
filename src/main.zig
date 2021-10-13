@@ -61,39 +61,91 @@ const Context = struct {
         points: i128,
     };
 
-    pub fn spendPoints(this: *@This(), allocator: *std.mem.Allocator, points: i128) !SpentPoints {
-        var payers = std.ArrayList(SpentPayer).init(allocator);
-        defer payers.deinit();
-
+    pub fn spendPoints(this: *@This(), allocator: *std.mem.Allocator, points: i128) !std.StringHashMap(i128) {
         if (points < 0) return error.CantSpendNegativePoints;
 
-        var points_left = points;
+        var spent_points = std.StringHashMap(i128).init(allocator);
+        errdefer spent_points.deinit();
 
-        var iter = this.payers.valueIterator();
-        while (iter.next()) |payer| {
-            if (points_left == 0) break;
-            const balance = payer.transactions.getBalance();
-            if (balance > 0) {
-                const points_used = std.math.min(balance, points_left);
-                try payers.append(.{ .name = payer.name, .points = -@intCast(i128, points_used) });
-                try payer.transactions.putNoClobber(std.time.timestamp(), -points_used);
-                points_left -= points_used;
+        var payers_oldest = std.StringHashMap(ArrayDeque(Payer.OldestPointsResult)).init(allocator);
+        defer {
+            var iter = payers_oldest.valueIterator();
+            while (iter.next()) |old_points_array| {
+                old_points_array.deinit();
+            }
+            payers_oldest.deinit();
+        }
+
+        {
+            var iter = this.payers.valueIterator();
+            while (iter.next()) |payer| {
+                var old_points = try payer.oldestPoints(allocator);
+                if (old_points.len() > 0) {
+                    try payers_oldest.putNoClobber(payer.name, old_points);
+                } else {
+                    old_points.deinit();
+                }
             }
         }
 
-        return SpentPoints{
-            .allocator = allocator,
-            .payers = payers.toOwnedSlice(),
-        };
+        var points_left = points;
+        while (points_left > 0) {
+            var oldest_points_or_null: ?Payer.OldestPointsResult = null;
+            var oldest_points_payer_name_or_null: ?[]const u8 = null;
+
+            var iter = payers_oldest.iterator();
+            while (iter.next()) |old_points_array_entry| {
+                const old_points = old_points_array_entry.value_ptr.idx(0).?;
+                if (oldest_points_or_null == null or old_points.timestamp < oldest_points_or_null.?.timestamp) {
+                    oldest_points_or_null = old_points;
+                    oldest_points_payer_name_or_null = old_points_array_entry.key_ptr.*;
+                }
+            }
+
+            if (oldest_points_or_null) |oldest_points| {
+                const points_used = std.math.min(oldest_points.amount, points_left);
+
+                const gop = try spent_points.getOrPut(oldest_points_payer_name_or_null.?);
+                if (!gop.found_existing) {
+                    gop.value_ptr.* = 0;
+                }
+                gop.value_ptr.* -= points_used;
+
+                const old_payer = payers_oldest.getPtr(oldest_points_payer_name_or_null.?).?;
+                if (oldest_points.amount > points_used) {
+                    const old_points = old_payer.idxMut(0).?;
+                    old_points.amount -= points_used;
+                } else {
+                    _ = old_payer.pop_front();
+                    if (old_payer.len() <= 0) {
+                        old_payer.deinit();
+                        std.debug.assert(payers_oldest.remove(oldest_points_payer_name_or_null.?));
+                    }
+                }
+
+                points_left -= oldest_points.amount;
+            } else {
+                return error.PointsWouldBeNegative;
+            }
+        }
+
+        // TODO: Make this atomic
+        const now = std.time.timestamp();
+        var iter = spent_points.iterator();
+        while (iter.next()) |spent_points_entry| {
+            const payer = this.payers.getPtr(spent_points_entry.key_ptr.*).?;
+            try payer.transactions.putNoClobber(now, spent_points_entry.value_ptr.*);
+        }
+
+        return spent_points;
     }
 
     pub fn getBalance(this: *@This(), allocator: *std.mem.Allocator) !std.StringHashMap(i128) {
         var payers = std.StringHashMap(i128).init(allocator);
-        defer payers.deinit();
+        errdefer payers.deinit();
 
         var iter = this.payers.valueIterator();
         while (iter.next()) |payer| {
-            std.log.warn("payer name = {s}", .{payer.name});
             try payers.putNoClobber(payer.name, payer.transactions.getBalance());
         }
 
@@ -110,9 +162,9 @@ const Payer = struct {
         amount: i128,
     };
 
-    fn oldestPoints(this: @This(), allocator: *std.mem.Allocator) !?OldestPointsResult {
+    fn oldestPoints(this: @This(), allocator: *std.mem.Allocator) !ArrayDeque(OldestPointsResult) {
         var points_queue = ArrayDeque(OldestPointsResult).init(allocator);
-        defer points_queue.deinit();
+        errdefer points_queue.deinit();
 
         var current_balance: i128 = 0;
         var iter = this.transactions.iterator(.first);
@@ -135,7 +187,7 @@ const Payer = struct {
             }
         }
 
-        return points_queue.pop_front();
+        return points_queue;
     }
 };
 
@@ -197,22 +249,17 @@ test "Use the oldest points" {
     // Add points to balance
     try ctx.addPoints(try parseDateTime("2020-11-02T14:00:00Z"), "DANNON", 1_000);
     try ctx.addPoints(try parseDateTime("2020-10-31T11:00:00Z"), "UNILEVER", 200);
+    try ctx.addPoints(try parseDateTime("2020-10-31T10:00:00Z"), "DANNON", 300);
     try ctx.addPoints(try parseDateTime("2020-10-31T15:00:00Z"), "DANNON", -200);
     try ctx.addPoints(try parseDateTime("2020-11-01T14:00:00Z"), "MILLER COORS", 10_000);
-    try ctx.addPoints(try parseDateTime("2020-10-31T10:00:00Z"), "DANNON", 300);
 
     // Spend 5,000 points, make sure the points are from the payers expected
     var spentPoints = try ctx.spendPoints(std.testing.allocator, 5_000);
     defer spentPoints.deinit();
 
-    try std.testing.expectEqualStrings("DANNON", spentPoints.payers[0].name);
-    try std.testing.expectEqual(@as(i128, -100), spentPoints.payers[0].points);
-
-    try std.testing.expectEqualStrings("UNILEVER", spentPoints.payers[1].name);
-    try std.testing.expectEqual(@as(i128, -200), spentPoints.payers[1].points);
-
-    try std.testing.expectEqualStrings("MILLER COORS", spentPoints.payers[2].name);
-    try std.testing.expectEqual(@as(i128, -4_700), spentPoints.payers[2].points);
+    try std.testing.expectEqual(@as(i128, -100), spentPoints.get("DANNON").?);
+    try std.testing.expectEqual(@as(i128, -200), spentPoints.get("UNILEVER").?);
+    try std.testing.expectEqual(@as(i128, -4_700), spentPoints.get("MILLER COORS").?);
 
     // get balance
     var balance = try ctx.getBalance(std.testing.allocator);
@@ -240,9 +287,17 @@ test "get payer's oldest points" {
     try payer.transactions.putNoClobber(1000, 1_337);
     try payer.transactions.putNoClobber(1001, -500);
 
-    try std.testing.expectEqual(Payer.OldestPointsResult{ .timestamp = 666, .amount = 500 }, (try payer.oldestPoints(std.testing.allocator)).?);
+    {
+        var oldest_points = try payer.oldestPoints(std.testing.allocator);
+        defer oldest_points.deinit();
+        try std.testing.expectEqual(Payer.OldestPointsResult{ .timestamp = 666, .amount = 500 }, oldest_points.idx(0).?);
+    }
 
     try payer.transactions.putNoClobber(1002, -501);
 
-    try std.testing.expectEqual(Payer.OldestPointsResult{ .timestamp = 1000, .amount = 1336 }, (try payer.oldestPoints(std.testing.allocator)).?);
+    {
+        var oldest_points = try payer.oldestPoints(std.testing.allocator);
+        defer oldest_points.deinit();
+        try std.testing.expectEqual(Payer.OldestPointsResult{ .timestamp = 1000, .amount = 1336 }, oldest_points.idx(0).?);
+    }
 }
