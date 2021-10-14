@@ -27,6 +27,7 @@ pub const Context = struct {
         const gop = try this.payers.getOrPut(payer);
         if (!gop.found_existing) {
             gop.value_ptr.name = try this.allocator.dupe(u8, payer);
+            gop.key_ptr.* = gop.value_ptr.name;
             gop.value_ptr.transactions = TransactionTree.init(this.allocator);
         }
 
