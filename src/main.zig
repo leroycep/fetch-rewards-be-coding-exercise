@@ -24,6 +24,7 @@ pub fn main() !void {
         comptime router.Router(*Context, &.{
             router.get("/balance", getBalance),
             router.post("/transactions", postTransaction),
+            router.post("/spend", postSpend),
             router.get("/", getIndex),
         }),
     );
@@ -63,8 +64,6 @@ fn postTransaction(ctx: *Context, response: *http.Response, request: http.Reques
         return error.InvalidFormat;
     }
 
-    std.log.warn("request = {}", .{std.zig.fmtEscapes(request.body())});
-
     const input = try std.json.parse(Input, &std.json.TokenStream.init(request.body()), .{ .allocator = &arena.allocator });
 
     if (input.payer == null or input.points == null or input.timestamp == null) {
@@ -96,6 +95,51 @@ fn postTransaction(ctx: *Context, response: *http.Response, request: http.Reques
     try std.json.stringify(Output{
         .message = "Points added",
     }, .{}, response.writer());
+}
+
+fn postSpend(ctx: *Context, response: *http.Response, request: http.Request) !void {
+    const Input = struct {
+        points: ?i128 = null,
+    };
+    const OutputErr = struct {
+        message: []const u8,
+    };
+
+    var arena = std.heap.ArenaAllocator.init(ctx.allocator);
+    defer arena.deinit();
+
+    const headers = try request.headers(&arena.allocator);
+
+    const mime_type = headers.get("Content-Type") orelse return error.InvalidFormat;
+    if (!std.mem.eql(u8, "application/json", mime_type)) {
+        return error.InvalidFormat;
+    }
+
+    const input = try std.json.parse(Input, &std.json.TokenStream.init(request.body()), .{ .allocator = &arena.allocator });
+
+    if (input.points == null) {
+        var error_message = std.ArrayList(u8).init(&arena.allocator);
+        const writer = error_message.writer();
+
+        try writer.writeAll("Malformed request; the following fields are missing: ");
+        if (input.points == null) try writer.writeAll("points, ");
+
+        response.status_code = .bad_request;
+        try response.headers.put("Content-Type", "application/json");
+        try std.json.stringify(OutputErr{
+            .message = error_message.items,
+        }, .{}, response.writer());
+        return;
+    }
+
+    const points = input.points orelse return error.InvalidFormat;
+
+    const payers_spent_from = try ctx.spendPoints(&arena.allocator, points);
+
+    var iter = payers_spent_from.iterator();
+    while (iter.next()) |entry| {
+        try response.writer().print("{s}: {}\n", .{ entry.key_ptr.*, entry.value_ptr.* });
+    }
 }
 
 test {
